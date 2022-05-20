@@ -1,0 +1,797 @@
+---
+title: "Land Bank Stewardship Analyses"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# initialize and import
+
+```{r}
+# import libraries
+library(tidyverse)
+library(tidycensus)
+library(sf)
+library(readxl)
+library(lubridate)
+library(arcgisbinding)
+library(haven)
+library(reticulate)
+library(mgcv)
+library(lmerTest)
+library(table1)
+library(sjPlot)
+library(stargazer)
+library(gamm4)
+library(magrittr)
+library(spdep)
+library(ncf)
+
+# import data files
+# kernel density data
+stseg_kd_data <- read_csv("U:/HBHE/PhD/Bushman/Papers-Presentations/2020-HBHE Colloquium/Data/yvpc-stseg-injury-p1crime-dv-kernel-densities.csv")
+parcel_kd_data <- read_csv("U:/HBHE/PhD/Bushman/Papers-Presentations/2020-HBHE Colloquium/Data/yvpc-parcel-injury-p1crime-dv-kernel-densities.csv")
+
+# import flint shapefile
+flint <- read_sf("U:/HBHE/PRC/GIS/Projects/MI-YVPC 2015-2020/Base Data/2018/Flint_MI_2018.gdb", "FL10_CityBoundary_v1") %>%
+  st_transform(crs = 6498)
+
+# create version with 1000m buffer
+flint_1000m <- st_buffer(flint, 1000)
+
+# flint parcels
+flint_parcel <- read_sf("U:/HBHE/PRC/GIS/Projects/MI-YVPC 2015-2020/Base Data/2018/Flint_MI_2018.gdb", "FL18_MIYVPC_Parcels_v12") %>%
+  st_transform(crs = 6498)
+
+
+# flint parcel metadata
+flint_parcel_md <- read_csv("U:/Secure/PRC/Data Repository/YVPC 2015-2020/_data-analysis/mow-cng-activity-parcel-counting-15-18.csv")
+```
+
+# Organize Flint Parcel Data
+
+```{r}
+# format the flint_parcel dataframe
+flint_parcel <- rename_with(flint_parcel, tolower, -Shape) %>%
+  dplyr::select(-shape_length, -shape_area) %>%
+  mutate(block_group_id = str_c("26049", census_tract_2010, census_block_group_2010)) %>%
+  select(miyvpc_parcel_id, parcel_id, block_group_id)
+
+# calculate flint parcel centroids
+flint_parcel_centroids <- st_centroid(flint_parcel)
+flint_parcel_centroids <- cbind(flint_parcel_centroids, st_coordinates(flint_parcel_centroids))
+
+# replace NAs in density variables with 0s
+parcel_kd_data <- parcel_kd_data %>%
+  mutate(across(matches("density_sqmile"), ~replace_na(., 0)))
+
+# join parcel metadata to parcel KDE data
+parcel_crime <- left_join(parcel_kd_data, flint_parcel_md, by = c("miyvpc_parcel_id" = "MIYVPC_Parcel_ID", "year"))
+
+# join parcel_crime data to MIYVPC parcel data
+parcel_crime <- left_join(parcel_crime, flint_parcel_centroids, by = c("miyvpc_parcel_id"))
+```
+
+# pull in census data
+
+```{r}
+# pull in census data from geodatabase
+gc_bgs <- st_read("C:/Users/grego/Documents/ArcGIS/Projects/PRC Work/YVPC/yvpc-assault-injury-densities/yvpc-assault-injury-densities.gdb", "acs_2019") %>%
+  select(GEOID, tot_pop, pop_dens, bg_area, disadvantage_index, sr_disadvantage_index)
+
+# merge with parcel_crime data
+parcel_crime <- left_join(parcel_crime, gc_bgs, by = c("block_group_id" = "GEOID"))
+```
+
+# set up dataframe for analysis
+
+```{r}
+# create parcel_crime data for analyses
+parcel_crime <- parcel_crime %>%
+  as.data.frame() %>%
+  select(-Shape.x, -Shape.y) %>%
+  mutate(any_reg_mow = ifelse(!is.na(n_mows) & n_mows > 2, 1, 0)) %>%
+  mutate(
+    year0 = year - 2015,
+    year_cat = factor(year),
+    any_reg_mow = ifelse(!is.na(n_mows) & n_mows > 2, 1, 0),
+    any_maintenance = rowSums(select(., green_activity, board_activity, any_reg_mow, lease_lot), na.rm = T),
+    any_maintenance = ifelse(any_maintenance > 0, T, F),
+    ownmain = case_when(
+      any_maintenance == TRUE ~ "maintained",
+      any_maintenance == FALSE & lb_owned == 1 ~ "owned",
+      any_maintenance == FALSE & lb_owned == 0 ~ "control",
+      TRUE ~ NA_character_
+    ),
+    disadvantage_index = disadvantage_index,
+    pop_dens = pop_dens * 1e6,
+    gclb_property = factor(lb_owned),
+    cng_area = factor(in_cng_area)
+  ) %>%
+  filter(year < 2019) %>%
+  distinct()
+```
+
+# Calculate Nearest Maintained Parcel
+
+```{r}
+# 2015
+int_parcels_15 <- parcel_crime %>%
+  filter(
+    any_maintenance == T,
+    year == 2015
+  ) %>%
+  distinct() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 6498)
+
+all_parcels_15 <- parcel_crime %>%
+  filter(year == 2015) %>%
+  distinct() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 6498)
+
+nearest_int_15 <- st_nearest_feature(all_parcels_15, int_parcels_15)
+parcel_dists_15 <- st_distance(all_parcels_15, int_parcels_15)
+
+parcel_distances_15 <- all_parcels_15 %>%
+  select(miyvpc_parcel_id) %>%
+  mutate(
+    index = 1:nrow(.),
+    year = 2015,
+    nearest_int = nearest_int_15
+  )
+
+parcel_distances_15$distances <- with(parcel_distances_15, parcel_dists_15[cbind(index, nearest_int_15)])
+
+rm(parcel_dists_15)
+
+
+# 2016
+int_parcels_16 <- parcel_crime %>%
+  filter(
+    any_maintenance == T,
+    year == 2016
+  ) %>%
+  distinct() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 6498)
+
+all_parcels_16 <- parcel_crime %>%
+  filter(year == 2016) %>%
+  distinct() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 6498)
+
+nearest_int_16 <- st_nearest_feature(all_parcels_16, int_parcels_16)
+parcel_dists_16 <- st_distance(all_parcels_16, int_parcels_16)
+
+parcel_distances_16 <- all_parcels_16 %>%
+  select(miyvpc_parcel_id) %>%
+  mutate(
+    index = 1:nrow(.),
+    year = 2016,
+    nearest_int = nearest_int_16
+  )
+
+parcel_distances_16$distances <- with(parcel_distances_16, parcel_dists_16[cbind(index, nearest_int_16)])
+
+rm(parcel_dists_16)
+
+
+# 2017
+int_parcels_17 <- parcel_crime %>%
+  filter(
+    any_maintenance == T,
+    year == 2017
+  ) %>%
+  distinct() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 6498)
+
+all_parcels_17 <- parcel_crime %>%
+  filter(year == 2017) %>%
+  distinct() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 6498)
+
+nearest_int_17 <- st_nearest_feature(all_parcels_17, int_parcels_17)
+parcel_dists_17 <- st_distance(all_parcels_17, int_parcels_17)
+
+parcel_distances_17 <- all_parcels_17 %>%
+  select(miyvpc_parcel_id) %>%
+  mutate(
+    index = 1:nrow(.),
+    year = 2017,
+    nearest_int = nearest_int_17
+  )
+
+parcel_distances_17$distances <- with(parcel_distances_17, parcel_dists_17[cbind(index, nearest_int_17)])
+
+rm(parcel_dists_17)
+
+
+# 2018
+int_parcels_18 <- parcel_crime %>%
+  filter(
+    any_maintenance == T,
+    year == 2018
+  ) %>%
+  distinct() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 6498)
+
+all_parcels_18 <- parcel_crime %>%
+  filter(year == 2018) %>%
+  distinct() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 6498)
+
+nearest_int_18 <- st_nearest_feature(all_parcels_18, int_parcels_18)
+parcel_dists_18 <- st_distance(all_parcels_18, int_parcels_18)
+
+parcel_distances_18 <- all_parcels_18 %>%
+  select(miyvpc_parcel_id) %>%
+  mutate(
+    index = 1:nrow(.),
+    year = 2018,
+    nearest_int = nearest_int_18
+  )
+
+parcel_distances_18$distances <- with(parcel_distances_18, parcel_dists_18[cbind(index, nearest_int_18)])
+
+rm(parcel_dists_18)
+
+
+# combine everything
+parcel_distances <- bind_rows(parcel_distances_15, parcel_distances_16, parcel_distances_17, parcel_distances_18) %>%
+  as.data.frame() %>%
+  select(miyvpc_parcel_id, year, dist_to_maintained = distances)
+
+# merge to parcel_crime
+parcel_crime <- left_join(parcel_crime, parcel_distances, by = c("miyvpc_parcel_id", "year"))
+```
+
+# Define vacant parcel subset to analyze
+
+```{r}
+# determine which parcels are in all waves, and don't change lb-class owner
+keep_parcels <- parcel_crime %>%
+  group_by(miyvpc_parcel_id) %>%
+  summarise(
+    n = n(),
+    lb_owned = sum(lb_owned),
+    vacant = sum(vacant)
+  ) %>%
+  filter(
+    n == 4,
+    lb_owned %in% c(0, 4),
+    vacant == 4
+  ) %>%
+  ungroup() %$%
+  miyvpc_parcel_id
+
+# create vacant parcel subset
+# filter out parcels that are "out-of-bounds"
+vacantparcel_crime <- parcel_crime %>% 
+  filter(
+    miyvpc_parcel_id %in% keep_parcels,
+    X < 4059597,
+    block_group_id != "260499800001"
+  )
+
+# recode parcel condition in 2015 for parcels that were leased 3 years (2016-2018)
+leased_parcels <- vacantparcel_crime %>%
+  group_by(miyvpc_parcel_id) %>%
+  summarize(years_leased = sum(lease_lot, na.rm = T)) %>%
+  filter(years_leased == 3) %$%
+  miyvpc_parcel_id %>%
+  unique()
+  
+vacantparcel_crime <- vacantparcel_crime %>%
+  mutate(
+    ownmain = ifelse(miyvpc_parcel_id %in% leased_parcels, "maintained", ownmain),
+    ownmain = factor(ownmain, levels = c("control", "maintained", "owned"))
+  )
+
+# exclude parcels that weren't owned by the land bank, but got more than 3 mows
+mow_mistakes <- vacantparcel_crime %>%
+  filter(lb_owned == FALSE, any_reg_mow == 1) %$%
+  miyvpc_parcel_id %>%
+  unique()
+
+vacantparcel_crime <- vacantparcel_crime %>%
+  filter(
+    !miyvpc_parcel_id %in% mow_mistakes,
+    miyvpc_parcel_id != "{AE52F0CA-F991-4542-A899-661C950BE26E}" 
+  )
+```
+
+### Shortcut to vacantparcel_crime data ###
+
+```{r}
+# write vacant parcel subset to memory
+# write_csv(vacantparcel_crime, "U:/HBHE/PhD/Bushman/Papers-Presentations/2021-Land Banks and Violence Prevention/Data/vacantparcel-crime-20210823.csv")
+
+vacantparcel_crime <- read_csv("U:/HBHE/PhD/Bushman/Papers-Presentations/2021-Land Banks and Violence Prevention/Data/vacantparcel-crime-20210823.csv") %>%
+  mutate(
+    ownmain = factor(ownmain, levels = c("control", "maintained", "owned")),
+    year_cat = factor(year_cat)
+  )
+```
+
+# calculate spatial lag covariate measures
+
+```{r}
+# deduplicate street segments
+# make the dataframe a spatial object
+# project data using EPSG:6498, Michigan South (meters)
+df_sf <- vacantparcel_crime %>%
+  select(miyvpc_parcel_id, X, Y, ownmain) %>%
+  distinct() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 6498)
+
+df_sf_coords <- coordinates(as(df_sf, "Spatial"))
+
+# calculate the inverse distance weights matrix (neighbors are parcels within 1000 meters)
+# max(unlist(nbdists(knn2nb(knearneigh(df_sf_coords, k=1)), df_sf_coords)))
+parcel_neighbors <- dnearneigh(df_sf_coords, 0, 1000)
+parcel_neigh_dists <- nbdists(parcel_neighbors, df_sf_coords)
+parcel_idw <- lapply(parcel_neigh_dists, function(x) (1/(x)))
+parcel_weights <- nb2listw(parcel_neighbors, glist = parcel_idw, style = "B")
+# parcel_weights <- nb2listw(parcel_neighbors) # turn off if IDW
+
+# # calculate k nearest neighbors weights matrix (neighbors are 5 closest parcels)
+# parcel_neighbors <- knearneigh(df_sf_coords, k = 10)
+# parcel_weights <- nb2listw(knn2nb(parcel_neighbors))
+
+# create reduced dataframe for calculating lagged variable
+# project the coordinate data
+parcel_lag <- vacantparcel_crime %>%
+  select(miyvpc_parcel_id, X, Y, year, contains("summerdensity_sqmile")) %>%
+  st_as_sf(coords = c("X", "Y"), crs = 6498)
+
+# split data by time point
+parcel_lag_list <- split(parcel_lag, parcel_lag$year)
+
+# calculate lagged variables within each time point
+parcel_lag_list <- lapply(parcel_lag_list, function(x){
+  x$p1crime_summerdensity_lag             <- lag.listw(parcel_weights, x$p1crime_summerdensity_sqmile, zero.policy = FALSE)
+  x$p1violcrime_summerdensity_lag         <- lag.listw(parcel_weights, x$p1violcrime_summerdensity_sqmile, zero.policy = FALSE)
+  x$p1youthviolcrime_summerdensity_lag    <- lag.listw(parcel_weights, x$p1youthviolcrime_summerdensity_sqmile, zero.policy = FALSE)
+  x$p1violguncrime_summerdensity_lag      <- lag.listw(parcel_weights, x$p1violguncrime_summerdensity_sqmile, zero.policy = FALSE)
+  x$p1youthviolguncrime_summerdensity_lag <- lag.listw(parcel_weights, x$p1youthviolguncrime_summerdensity_sqmile, zero.policy = FALSE)
+  return(x)
+})
+
+# combine all time points of lagged variable
+parcel_lag <- do.call("bind_rows", parcel_lag_list)
+
+# join lagged variables back to original data
+vacantparcel_crime <- left_join(vacantparcel_crime, parcel_lag %>% as.data.frame() %>% select(miyvpc_parcel_id, year, contains("summerdensity_lag")), by = c("miyvpc_parcel_id", "year"))
+```
+
+# description of the data
+
+```{r}
+table1(~year_cat + pop_dens + disadvantage_index + p1crime_summerdensity_sqmile + p1violcrime_summerdensity_sqmile + p1youthviolcrime_summerdensity_sqmile + p1violguncrime_summerdensity_sqmile + p1youthviolguncrime_summerdensity_sqmile | ownmain, data = vacantparcel_crime)
+```
+
+# run gclb ownership analyses, based only on GCLB/vacant properties
+
+```{r}
+# TEST MODELS TO ILLUSTRATE AUTOCORRELATION ISSUES
+# associations between GCLB ownership and all crime
+
+# lmer non-spatial model
+lmer_gclbvac_all_ns <- lmer(
+  p1crime_summerdensity_sqmile ~
+    gclb_property*year0 +
+    disadvantage_index +
+    pop_dens +
+    (1|miyvpc_parcel_id),
+  data = vacantparcel_crime
+)
+
+summary(lmer_gclbvac_all_ns)
+
+# lmer spatial lag model
+lmer_gclbvac_all <- lmer(
+  p1crime_summerdensity_sqmile ~
+    gclb_property*year0 +
+    disadvantage_index +
+    pop_dens +
+    p1crime_summerdensity_lag +
+    (1|miyvpc_parcel_id),
+  data = vacantparcel_crime
+)
+
+summary(lmer_gclbvac_all)
+
+# trend surface gam model
+gam_gclbvac_all <- gamm4(
+  p1crime_summerdensity_sqmile ~ 
+    gclb_property*year0 + 
+    disadvantage_index +
+    pop_dens +
+    s(X, Y),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime
+)
+
+summary(gam_gclbvac_all$gam)
+vis.gam(gam_gclbvac_all$gam, view = c("X", "Y"), plot.type = "persp", theta = 45, phi = 45)
+
+# trend surface gam model, increased knots
+gam_gclbvac_all <- gamm4(
+  p1crime_summerdensity_sqmile ~ 
+    gclb_property*year0 + 
+    disadvantage_index +
+    pop_dens +
+    s(X, Y, k = 50, fx = TRUE),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime
+)
+
+summary(gam_gclbvac_all$gam)
+vis.gam(gam_gclbvac_all$gam, view = c("X", "Y"), plot.type = "persp", theta = 45, phi = 45)
+
+# trend surface gam model, increased knots, maximum likelihood
+gam_gclbvac_all_ml <- gamm4(
+  p1crime_summerdensity_sqmile ~ 
+    gclb_property*year0 + 
+    disadvantage_index +
+    pop_dens +
+    s(X, Y, k = 50, fx = TRUE),
+  random = ~(1|miyvpc_parcel_id),
+  REML = FALSE,
+  data = vacantparcel_crime
+)
+
+summary(gam_gclbvac_all_ml$gam)
+vis.gam(gam_gclbvac_all$gam, view = c("X", "Y"), plot.type = "persp", theta = 45, phi = 45)
+
+# trend surface gam model, increased knots, with lag
+gamlag_gclbvac_all <- gamm4(
+  p1crime_summerdensity_sqmile ~ 
+    gclb_property*year0 + 
+    disadvantage_index +
+    pop_dens +
+    p1crime_summerdensity_lag +
+    s(X, Y, k = 50, fx = TRUE),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime
+)
+
+summary(gamlag_gclbvac_all$gam)
+vis.gam(gamlag_gclbvac_all$gam, view = c("X", "Y"), plot.type = "persp", theta = 45, phi = 45)
+```
+
+```{r}
+# associations between GCLB ownership and all crime
+gam_gclbvac_all <- gamm4(
+  p1crime_summerdensity_sqmile ~ 
+    gclb_property*year0 + 
+    disadvantage_index +
+    pop_dens +
+    s(X, Y, k = 50),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime
+)
+
+summary(gam_gclbvac_all$gam)
+
+# associations between GCLB ownership and violent crime
+gam_gclbvac_viol <- gamm4(
+  p1violcrime_summerdensity_sqmile ~ 
+    gclb_property*year0 + 
+    pop_dens + 
+    disadvantage_index +
+    s(X, Y, k = 50),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime
+)
+
+summary(gam_gclbvac_viol$gam)
+
+# associations between GCLB ownership and youth-involved violent crime
+gam_gclbvac_youthviol <- gamm4(
+  p1youthviolcrime_summerdensity_sqmile ~ 
+    gclb_property*year0 + 
+    pop_dens + 
+    disadvantage_index +
+    s(X, Y, k = 50),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime
+)
+
+summary(gam_gclbvac_youthviol$gam)
+
+# associations between GCLB ownership and gun crime
+gam_gclbvac_gun <- gamm4(
+  p1violguncrime_summerdensity_sqmile ~ 
+    gclb_property*year0 + 
+    pop_dens + 
+    disadvantage_index +
+    s(X, Y, k = 50),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime
+)
+
+summary(gam_gclbvac_gun$gam)
+
+# associations between GCLB ownership and youth-involved gun crime
+gam_gclbvac_youthgun <- gamm4(
+  p1youthviolguncrime_summerdensity_sqmile ~ 
+    gclb_property*year0 + 
+    pop_dens + 
+    disadvantage_index +
+    s(X, Y, k = 50),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime
+)
+
+summary(gam_gclbvac_youthgun$gam)
+```
+
+```{r}
+# table results
+model <- gam_gclbvac_youthgun$gam
+
+summary(model)
+
+cbind(estimate = coefficients(model), confint(model)) %>% round(digits = 4) %>% as.data.frame() %>% transmute(vars = row.names(.), report = str_c(estimate, " (", `2.5 %`, ", ", `97.5 %`, ")")) %>% filter(grepl("s\\(X,Y\\)", vars) == F)
+```
+
+# run ownership/maintenance analyses
+
+```{r}
+# associations between GCLB ownership and all crime
+gam_mowvac_all <- gamm4(
+  p1crime_summerdensity_sqmile ~ 
+    ownmain*year0 + 
+    disadvantage_index +
+    pop_dens +
+    s(X, Y, k = 50),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime
+)
+
+summary(gam_mowvac_all$gam)
+
+# associations between GCLB ownership and violent crime
+gam_mowvac_viol <- gamm4(
+  p1violcrime_summerdensity_sqmile ~ 
+    ownmain*year0 + 
+    pop_dens + 
+    disadvantage_index +
+    s(X, Y, k = 50),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime
+)
+
+summary(gam_mowvac_viol$gam)
+
+# associations between GCLB ownership and youth-involved violent crime
+gam_mowvac_youthviol <- gamm4(
+  p1youthviolcrime_summerdensity_sqmile ~ 
+    ownmain*year0 + 
+    pop_dens + 
+    disadvantage_index +
+    s(X, Y, k = 50),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime
+)
+
+summary(gam_mowvac_youthviol$gam)
+
+# associations between GCLB ownership and gun crime
+gam_mowvac_gun <- gamm4(
+  p1violguncrime_summerdensity_sqmile ~ 
+    ownmain*year0 + 
+    pop_dens + 
+    disadvantage_index +
+    s(X, Y, k = 50),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime
+)
+
+summary(gam_mowvac_gun$gam)
+
+# associations between GCLB ownership and youth-involved gun crime
+gam_mowvac_youthgun <- gamm4(
+  p1youthviolguncrime_summerdensity_sqmile ~ 
+    ownmain*year0 + 
+    pop_dens + 
+    disadvantage_index +
+    s(X, Y, k = 50),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime
+)
+
+summary(gam_mowvac_youthgun$gam)
+
+```
+
+```{r}
+# table results
+model <- gam_mowvac_youthgun$gam
+
+summary(model)
+
+cbind(estimate = coefficients(model), confint(model)) %>% round(digits = 4) %>% as.data.frame() %>% transmute(vars = row.names(.), report = str_c(estimate, " (", `2.5 %`, ", ", `97.5 %`, ")")) %>% filter(grepl("s\\(X,Y\\)", vars) == F)
+```
+
+# CnG group analyses
+
+```{r}
+# associations between GCLB ownership and all crime
+gam_cngareavac_all <- gamm4(
+  p1crime_summerdensity_sqmile ~ 
+    cng_area*year0 + 
+    disadvantage_index +
+    pop_dens +
+    s(X, Y, k = 50),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime %>% filter(any_maintenance == FALSE)
+)
+
+summary(gam_cngareavac_all$gam)
+
+# associations between GCLB ownership and violent crime
+gam_cngareavac_viol <- gamm4(
+  p1violcrime_summerdensity_sqmile ~ 
+    cng_area*year0 + 
+    pop_dens + 
+    disadvantage_index +
+    s(X, Y, k = 50),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime %>% filter(any_maintenance == FALSE)
+)
+
+summary(gam_cngareavac_viol$gam)
+
+# associations between GCLB ownership and youth-involved violent crime
+gam_cngareavac_youthviol <- gamm4(
+  p1youthviolcrime_summerdensity_sqmile ~ 
+    cng_area*year0 + 
+    pop_dens + 
+    disadvantage_index +
+    s(X, Y, k = 50),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime %>% filter(any_maintenance == FALSE)
+)
+
+summary(gam_cngareavac_youthviol$gam)
+
+# associations between GCLB ownership and gun crime
+gam_cngareavac_gun <- gamm4(
+  p1violguncrime_summerdensity_sqmile ~ 
+    cng_area*year0 + 
+    pop_dens + 
+    disadvantage_index +
+    s(X, Y, k = 50),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime %>% filter(any_maintenance == FALSE)
+)
+
+summary(gam_cngareavac_gun$gam)
+
+# associations between GCLB ownership and youth-involved gun crime
+gam_cngareavac_youthgun <- gamm4(
+  p1youthviolguncrime_summerdensity_sqmile ~ 
+    cng_area*year0 + 
+    pop_dens + 
+    disadvantage_index +
+    s(X, Y, k = 50),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime %>% filter(any_maintenance == FALSE)
+)
+
+summary(gam_cngareavac_youthgun$gam)
+
+```
+
+# Distance to nearest maintained parcel
+
+```{r}
+vacantparcel_crime <- vacantparcel_crime %>% 
+  group_by(miyvpc_parcel_id) %>% 
+  arrange(year) %>% 
+  mutate(
+    dist_to_maintained = as.numeric(dist_to_maintained),
+    p1crime_sd_sqm_yearlag = lag(p1crime_summerdensity_sqmile),
+    p1crime_yoy_chg = ((p1crime_summerdensity_sqmile - p1crime_sd_sqm_yearlag) / p1crime_sd_sqm_yearlag) * 100,
+    dist_cat = case_when(
+      dist_to_maintained > 0 & dist_to_maintained <= 50 ~ "A. 0-50",
+      dist_to_maintained > 50 & dist_to_maintained <= 100 ~ "B. 50-100",
+      dist_to_maintained > 100 & dist_to_maintained <= 150 ~ "C. 100-150",
+      dist_to_maintained > 150 & dist_to_maintained <= 200 ~ "D. 150-200",
+      dist_to_maintained > 200 & dist_to_maintained <= 250 ~ "E. 200-250",
+      dist_to_maintained > 250 & dist_to_maintained <= 300 ~ "F. 250-300",
+      dist_to_maintained > 300 & dist_to_maintained <= 350 ~ "G. 300-350",
+      dist_to_maintained > 350 & dist_to_maintained <= 400 ~ "H. 350-400",
+      dist_to_maintained > 400 & dist_to_maintained <= 450 ~ "I. 400-450",
+      dist_to_maintained > 450 & dist_to_maintained <= 500 ~ "J. 450-500",
+      TRUE ~ "K. 500+"
+    ),
+    dist_cat = factor(dist_cat, levels = c("A. 0-50", "B. 50-100", "C. 100-150", "D. 150-200", "E. 200-250", "F. 250-300", "G. 300-350", "H. 350-400", "I. 400-450", "J. 450-500", "K. 500+"))
+  ) %>% 
+  ungroup() %>% 
+  arrange(miyvpc_parcel_id)
+
+# associations between GCLB ownership and all crime
+gam_distan_all <- gamm4(
+  p1crime_summerdensity_sqmile ~ 
+    dist_cat*year0 +
+    disadvantage_index +
+    pop_dens +
+    s(X, Y),
+  random = ~(1|miyvpc_parcel_id),
+  data = vacantparcel_crime %>% filter(any_maintenance == FALSE)
+)
+
+summary(gam_distan_all$gam)
+
+# plot
+vacantparcel_crime %>%
+  ggplot(aes(x = year, y = p1crime_summerdensity_sqmile, color = dist_cat)) +
+  geom_smooth(method = "loess", se = FALSE) +
+  theme_classic() +
+  labs(x = "Year", y = "P1 Crime Density", color = "Dist. to Nearest/nMaintained Parcel")
+```
+
+# Moran's I test for models
+
+```{r}
+set.seed(20210811)
+
+# specify which model you want to calculate Moran's I for
+# (call it mi_model, so the code below doesn't need to be changed)
+mi_model <- gam_gclbvac_all$gam
+
+# bind residuals to model frame
+mi_residframe <- cbind(model.frame(mi_model), residuals = residuals(mi_model))
+
+# merge spatial information onto residframe from zip_coords object
+# calculate total residual for each unit/location
+mi_residframe <- mi_residframe %>%
+  #left_join(., vacantparcel_crime %>% select(miyvpc_parcel_id, X, Y), by = c("miyvpc_parcel_id")) %>%
+  filter(year0 == 1) %>%
+  group_by(miyvpc_parcel_id) %>%
+  summarise(residuals = first(residuals), X = first(X), Y = first(Y)) %>%
+  ungroup() %>%
+  distinct() %>%
+  st_as_sf(coords = c("X", "Y"), crs = 6498)
+
+mi_residframe_coords <- coordinates(as(mi_residframe, "Spatial"))
+
+# map residuals
+ggplot(mi_residframe) + geom_sf(aes(color = residuals), alpha = 0.6) + theme_classic()
+
+# calculate the inverse distance weights matrix (neighbors are street segments within 1000 meters)
+resid_neighbors <- dnearneigh(mi_residframe_coords, 0, 300)
+# resid_neigh_dists <- nbdists(resid_neighbors, mi_residframe_coords)
+# resid_idw <- lapply(resid_neigh_dists, function(x) (1/(x)))
+resid_idw_weights <- nb2listw(resid_neighbors, zero.policy = TRUE)
+
+# use same weights matrix as we used to calculate lagged variable
+moran.test(mi_residframe$residuals, resid_idw_weights, zero.policy = TRUE)
+```
+
+# Parked Code
+
+```{r}
+# inverse distance weights matrix for points (inverse distance is one of many methods)
+site_dists <- as.matrix(dist(cbind(mi_residframe$X, mi_residframe$Y)))
+site_dists_inv <- 1/site_dists
+site_dists_inv[is.infinite(site_dists_inv)] <- 0   
+
+# calculate Moran's I statistic using ape package
+Moran.I(mi_residframe$residuals, site_dists_inv)
+
+# # check autocorrelation continuously
+mi_residframe <- mi_residframe %>%
+  mutate(
+    X = st_coordinates(.)[,"X"],
+    Y = st_coordinates(.)[,"Y"]
+  )
+# 
+mi_residuals_saplot <- spline.correlog(x=mi_residframe$X, y=mi_residframe$Y, z=mi_residframe$residuals, resamp=100, quiet=TRUE)
+plot(mi_residuals_saplot)
+```

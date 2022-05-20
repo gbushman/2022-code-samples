@@ -1,0 +1,619 @@
+---
+title: 'Pulse Survey Analysis: EDA'
+output: html_document
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+<style>
+  body .main-container {
+    max-width: 1300px;
+  }
+</style>
+  
+```{r initialize-import}
+# load libraries
+library(tidyverse)
+library(tidycensus)
+library(lubridate)
+library(lme4)
+library(stargazer)
+library(sjPlot)
+library(table1)
+library(pander)
+library(descr)
+library(knitr)
+source("http://pcwww.liv.ac.uk/~william/R/crosstab.r")
+library(survey)
+library(tableone)
+library(ggeffects)
+library(emmeans)
+library(margins)
+library(interactions)
+
+# setwd
+setwd("U:/HBHE/PhD/Bushman/Misc Projects/COVID and Housing/Data Files/")
+
+# import public-use data files
+puf1  <- read_csv("pulse2020_puf_01.csv")
+puf2  <- read_csv("pulse2020_puf_02.csv")
+puf3  <- read_csv("pulse2020_puf_03.csv")
+puf4  <- read_csv("pulse2020_puf_04.csv")
+puf5  <- read_csv("pulse2020_puf_05.csv")
+puf6  <- read_csv("pulse2020_puf_06.csv")
+puf7  <- read_csv("pulse2020_puf_07.csv")
+puf8  <- read_csv("pulse2020_puf_08.csv")
+puf9  <- read_csv("pulse2020_puf_09.csv")
+puf10 <- read_csv("pulse2020_puf_10.csv")
+puf11 <- read_csv("pulse2020_puf_11.csv")
+puf12 <- read_csv("pulse2020_puf_12.csv")
+
+# rescale weights within each wave
+puf_list <- list(puf1, puf2, puf3, puf4, puf5, puf6, puf7, puf8, puf9, puf10, puf11, puf12)
+
+# combine public-use data files
+puf_agg <- bind_rows(puf1, puf2, puf3, puf4, puf5, puf6, puf7, puf8, puf9, puf10, puf11, puf12)
+
+# make colnames lowercase
+puf_agg <- rename_all(puf_agg, tolower)
+```
+
+```{r}
+# clean up formatting of variables
+puf <- puf_agg %>%
+  mutate(
+    age = year(Sys.Date()) - tbirth_year,
+    week_txt = str_c("Week ", week),
+    state = est_st,
+    msa = est_msa,
+    race = case_when(
+      rhispanic == 2 ~ "Hispanic",
+      rhispanic == 1 & rrace == 1 ~ "NH White",
+      rhispanic == 1 & rrace == 2 ~ "NH Black",
+      TRUE ~ "Other"
+    ),
+    race = factor(race, levels = c("NH White", "NH Black", "Hispanic", "Other")),
+    egender = factor(egender, c(1:2), c("Male", "Female")),
+    tenure = factor(tenure, c(1:4), c("Owned, no loan", "Owned w/ loan", "Rented", "Occupied w/o rent")),
+    tenure3 = fct_recode(tenure, NULL = "Occupied w/o rent"),
+    tenure2 = fct_recode(tenure3, NULL = "Owned, no loan"),
+    mortlmth = factor(mortlmth, c(1:3), c("Yes", "No", "Deferred payment")),
+    mortconf = factor(mortconf, c(1:5), c("None", "Slight", "Moderate", "High", "Will defer")),
+    mortconf4 = fct_collapse(mortconf, Low = c("None", "Slight"), Moderate = "Moderate", High = "High", `Will defer` = "Will defer"),
+    mortconf4 = relevel(mortconf4, ref = "High"),
+    mortconf5 = ifelse(tenure == "Owned, no loan" & is.na(mortconf), "No mortgage/rent", as.character(mortconf4)),
+    mortconf5 = factor(mortconf5, levels = c("No mortgage/rent", "High", "Moderate", "Low", "Will defer")),
+    anywork = factor(anywork, c(1:2), c("Yes", "No")),
+    wrkloss = factor(wrkloss, c(1:2), c("Yes", "No")),
+    wrkloss = relevel(wrkloss, ref = "No"),
+    expctloss = factor(expctloss, c(1:2), c("Yes", "No")),
+    ms = factor(ms, c(1:5), c("Married", "Widowed", "Divorced", "Separated", "Never married")),
+    ms2 = fct_collapse(ms, Married = "Married", Single = c("Widowed", "Divorced", "Separated", "Never married")),
+    eeduc = case_when(
+      eeduc %in% c(1:2) ~ "Less than HS grad",
+      eeduc %in% c(3) ~ "HS grad",
+      eeduc %in% c(4:7) ~ "At least some college",
+      TRUE ~ NA_character_
+    ),
+    eeduc = factor(eeduc, levels = c("Less than HS grad", "HS grad", "At least some college")),
+    hlthstatus = factor(hlthstatus, c(5:1), c("Poor", "Fair", "Good", "Very Good", "Excellent")),
+    hlthstatus_num = as.numeric(hlthstatus),
+    hlthstatus_z = scale(hlthstatus_num)[ ,1],
+    hlthstatus2 = fct_collapse(hlthstatus, Good = c("Excellent", "Very Good"), Poor = c("Poor", "Fair", "Good")),
+    hlthstatus2 = case_when(hlthstatus2 == "Good" ~ TRUE, hlthstatus2 == "Poor" ~ FALSE, TRUE ~ NA),
+    anxious = factor(anxious, c(1:4), c("Not at all", "Several days", "More than half the days", "Nearly every day")),
+    anxious_num = as.numeric(anxious) - 1,
+    worry = factor(worry, c(1:4), c("Not at all", "Several days", "More than half the days", "Nearly every day")),
+    worry_num = as.numeric(worry) - 1,
+    posanxscreen = anxious_num, worry_num,
+    posanxscreen = ifelse(posanxscreen < 0, NA, posanxscreen),
+    posanxscreen2 = ifelse(posanxscreen >= 3, TRUE, FALSE),
+    interest = factor(interest, c(1:4), c("Not at all", "Several days", "More than half the days", "Nearly every day")),
+    interest_num = as.numeric(interest) - 1,
+    down = factor(down, c(1:4), c("Not at all", "Several days", "More than half the days", "Nearly every day")),
+    down_num = as.numeric(down) - 1,
+    posdepscreen = interest_num, down_num,
+    posdepscreen = ifelse(posdepscreen < 0, NA, posdepscreen),
+    posdepscreen2 = ifelse(posdepscreen >= 3, TRUE, FALSE),
+    mentaldis = anxious_num + worry_num + interest_num + down_num,
+    mentaldis = ifelse(mentaldis < 0, NA, mentaldis),
+    mentaldis_z = scale(mentaldis)[ ,1],
+    mentaldis2 = ifelse(posanxscreen2 == TRUE | posdepscreen2 == TRUE, TRUE, FALSE),
+    hlthins1 = case_when(hlthins1 == 1 ~ TRUE, hlthins1 == 2 ~ FALSE, TRUE ~ NA),
+    hlthins2 = case_when(hlthins2 == 1 ~ TRUE, hlthins2 == 2 ~ FALSE, TRUE ~ NA),
+    hlthins3 = case_when(hlthins3 == 1 ~ TRUE, hlthins3 == 2 ~ FALSE, TRUE ~ NA),
+    hlthins4 = case_when(hlthins4 == 1 ~ TRUE, hlthins4 == 2 ~ FALSE, TRUE ~ NA),
+    hlthins5 = case_when(hlthins5 == 1 ~ TRUE, hlthins5 == 2 ~ FALSE, TRUE ~ NA),
+    hlthins6 = case_when(hlthins6 == 1 ~ TRUE, hlthins6 == 2 ~ FALSE, TRUE ~ NA),
+    hlthins7 = case_when(hlthins7 == 1 ~ TRUE, hlthins7 == 2 ~ FALSE, TRUE ~ NA),
+    hlthins8 = case_when(hlthins8 == 1 ~ TRUE, hlthins8 == 2 ~ FALSE, TRUE ~ NA),
+    any_hlthins = rowSums(select(., hlthins1:hlthins8), na.rm = T),
+    any_hlthins = ifelse(any_hlthins >= 1, "Yes", "No"),
+    any_hlthins = factor(any_hlthins, levels = c("No", "Yes")),
+    prifoodsuf = factor(prifoodsuf, c(1:4), c("Enough of the kinds of food (I/we) wanted to eat", "Enough, but not always the kinds of food (I/we) wanted to eat", "Sometimes not enough to eat", "Often not enough to eat")),
+    prifoodsuf2 = fct_collapse(prifoodsuf, Enough = "Enough of the kinds of food (I/we) wanted to eat", `Not enough` = c("Enough, but not always the kinds of food (I/we) wanted to eat", "Sometimes not enough to eat", "Often not enough to eat")),
+    curfoodsuf = factor(curfoodsuf, c(1:4), c("Enough of the kinds of food (I/we) wanted to eat", "Enough, but not always the kinds of food (I/we) wanted to eat", "Sometimes not enough to eat", "Often not enough to eat")),
+    curfoodsuf2 = fct_collapse(curfoodsuf, Enough = "Enough of the kinds of food (I/we) wanted to eat", `Not enough` = c("Enough, but not always the kinds of food (I/we) wanted to eat", "Sometimes not enough to eat", "Often not enough to eat")),
+    freefood = case_when(freefood == 1 ~ TRUE, freefood == 2 ~ FALSE, TRUE ~ NA),
+    foodconf = factor(foodconf, c(1:4), c("Not at all", "Somewhat", "Moderately", "High")),
+    foodconf3 = fct_collapse(foodconf, Low = c("Not at all", "Somewhat"), Moderate = "Moderately", High = "High"),
+    foodconf3 = relevel(foodconf3, ref = "High"),
+    income = factor(income, c(1:8), c("Less than $25,000", "$25,000 - $34,999", "$35,000 - $49,999", "$50,000 - $74,999", "$75,000 - $99,999", "$100,000 - $149,999", "$150,000 - $199,999", "$200,000 and above")),
+    income7 = fct_collapse(income, `$150,000+` = c("$150,000 - $199,999", "$200,000 and above")),
+    income7 = relevel(income7, ref = "$150,000+"),
+    rsnnowrk = factor(rsnnowrk, c(1:12), c("I did not want to be employed at this time", "I did not work because I am/was sick with coronavirus symptoms", "I did not work because I am/was caring for someone with coronavirus symptoms", "I did not work because I am/was caring for children not in school or daycare","I did not work because I am/was caring for an elderly person", "I am/was sick (not coronavirus related) or disabled", "I am retired", "I did not have work due to coronavirus pandemic related reduction in business (including furlough)", "I am/was laid off due to coronavirus pandemic", "My employment closed temporarily due to the coronavirus pandemic", "My employment went out of business due to the coronavirus pandemic", "Other reason, please specifiy"))
+  )
+
+
+# # # calculate changes in tenure
+# puf_tenure_change <- puf %>%
+#   select(scram, week, tenure) %>%
+#   group_by(scram) %>%
+#   arrange(week) %>%
+#   filter(!is.na(tenure)) %>%
+#   summarise(
+#     tenure_change = case_when(
+#       first(tenure) == "Rented" & last(tenure) %in% c("Owned, no loan", "Owned w/ loan") ~ "Renter to owner",
+#       first(tenure) %in% c("Owned, no loan", "Owned w/ loan") & last(tenure) == "Rented" ~ "Owner to renter",
+#       first(tenure) == last(tenure) ~ "No tenure change",
+#       TRUE ~ "Other tenure change"
+#     )
+#   ) %>%
+#   ungroup()
+# 
+# # merge tenure change variable back onto data frame
+# puf <- left_join(puf, puf_tenure_change, by = c("scram"))
+
+# variable labels
+label(puf$age)          <- "Age"
+label(puf$income)       <- "Total Household Income (8 cat)"
+label(puf$income7)       <- "Total Household Income (7 cat)"
+label(puf$race)         <- "Race/ethnicity"
+label(puf$egender)      <- "Gender"
+label(puf$tenure)       <- "Housing tenure"
+# label(puf$tenure_change) <- "Change in housing tenure"
+label(puf$thhld_numper) <- "Total number of people in household"
+label(puf$mortlmth)     <- "Able to pay last month's rent?"
+label(puf$mortconf)     <- "Confidence pay next month's rent"
+label(puf$anywork)      <- "Any work in last 7 days?"
+label(puf$wrkloss)      <- "Recent household job loss?"
+label(puf$expctloss)    <- "Expected household job loss?"
+label(puf$rsnnowrk)     <- "Reason for not working"
+label(puf$ms)           <- "Marital status"
+label(puf$eeduc)        <- "Educational attainment"
+label(puf$hlthstatus)   <- "Self-rated health status (5 level)"
+label(puf$hlthstatus2)  <- "Good health status (2 level, y/n)"
+label(puf$mentaldis)    <- "Self-reported symptoms of mental distress"
+label(puf$mentaldis2)   <- "Positive screen for anxiety or depression"
+label(puf$worry)        <- "Frequency of worry in last 7 days"
+label(puf$anxious)      <- "Frequency of anxiety in last 7 days"
+label(puf$posanxscreen2)<- "Positive screen for anxiety"
+label(puf$interest)     <- "Frequency of having little interest in things in last 7 days"
+label(puf$down)         <- "Frequency of feelings of depression in last 7 days"
+label(puf$posdepscreen2)<- "Positive screen for depression"
+label(puf$any_hlthins)  <- "Has any health insurance?"
+label(puf$hlthins1)     <- "Has health insurance from employer?"
+label(puf$hlthins2)     <- "Has health insurance directly from insurer (marketplace)?"
+label(puf$hlthins3)     <- "Has health insurance through Medicare (65+)?"
+label(puf$hlthins4)     <- "Has health insurance through Medicaid?"
+label(puf$hlthins5)     <- "Has health insurance through TRICARE (military)?"
+label(puf$hlthins6)     <- "Has health insurance through VA?"
+label(puf$hlthins7)     <- "Has health insurance through the Indian Health Service?"
+label(puf$hlthins8)     <- "Has health insurance another way?"
+label(puf$prifoodsuf)   <- "Food sufficiency prior to March 13th"
+label(puf$prifoodsuf2)  <- "Food sufficiency prior to March 13th (2 cat)"
+label(puf$curfoodsuf)   <- "Current food sufficiency"
+label(puf$curfoodsuf2)  <- "Current food sufficiency (2 cat)"
+label(puf$freefood)     <- "Received free food in the last 7 days"
+label(puf$foodconf)     <- "Confidence in ability to buy food for the next 4 weeks"
+label(puf$foodconf3)    <- "Confidence in ability to buy food for the next 4 weeks (3 cat)"
+```
+
+```{r}
+puf_filt <- puf %>%
+  filter(
+    !is.na(tenure),
+    !is.na(tenure3),
+    !is.na(hlthstatus_num),
+    !is.na(mentaldis)
+  )
+
+# create survey design objects
+# for repeat observations data
+puf_svy <- svydesign(id = ~0, weights = ~pweight, data = puf_filt)
+
+# check weighting for each wave
+# test_counts <- svyCreateTableOne(vars = c("week_txt"), data = puf_svy)
+# print(test_counts)
+```
+
+# Summary of Data
+
+## Table 1
+
+```{r}
+tableOne_all <- svyCreateTableOne(vars = c("hlthstatus_num", "mentaldis", "age", "thhld_numper", "wrkloss", "foodconf3", "mortconf4", "race", "egender", "eeduc", "ms2", "any_hlthins", "income7"), data = puf_svy)
+
+kable(print(tableOne_all, missing = TRUE))
+
+tableOne_strat <- svyCreateTableOne(vars = c("hlthstatus_num", "mentaldis", "age", "thhld_numper", "wrkloss", "foodconf3", "mortconf4", "race", "egender", "eeduc", "ms2", "any_hlthins", "income7"), strata = "tenure3", data = puf_svy)
+
+kable(print(tableOne_strat, missing = TRUE))
+```
+
+```{r, include=FALSE}
+# check test statistics included in table one
+summary(aov(svyglm(hlthstatus_num ~ tenure3, design = puf_svy)))
+summary(aov(svyglm(mentaldis ~ tenure3, design = puf_svy)))
+summary(aov(svyglm(age ~ tenure3, design = puf_svy)))
+summary(aov(svyglm(thhld_numper ~ tenure3, design = puf_svy)))
+svychisq(~wrkloss+tenure3, design = puf_svy)
+svychisq(~foodconf3+tenure3, design = puf_svy)
+svychisq(~mortconf4+tenure2, design = puf_svy)
+svychisq(~race+tenure3, design = puf_svy)
+svychisq(~egender+tenure3, design = puf_svy)
+svychisq(~eeduc+tenure3, design = puf_svy)
+svychisq(~ms2+tenure3, design = puf_svy)
+svychisq(~income7+tenure3, design = puf_svy)
+```
+
+# Analytic Models
+
+## Health and Mental Health
+
+```{r}
+# lmer test
+wmmodel_hs_lmer <- lmer(
+  hlthstatus_num ~
+    (1 | scram),
+  data = puf_filt %>% mutate(
+    scram = as.factor(scram)
+  ),
+  weights = pweight,
+  control=lmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e6))
+)
+
+# lmer test
+wmmodel_md_lmer <- lmer(
+  mentaldis ~
+    (1 | scram),
+  data = puf_filt %>% mutate(
+    scram = as.factor(scram)
+  ),
+  weights = pweight,
+  control=lmerControl(optimizer="bobyqa", optCtrl=list(maxfun=2e6))
+)
+```
+
+```{r}
+# HEALTH MODEL
+# tenure main effect only model
+model_hs <- svyglm(
+  hlthstatus_num ~
+    tenure3 +
+    thhld_numper +
+    age +
+    eeduc +
+    ms2 +
+    race +
+    egender +
+    any_hlthins +
+    income7,
+  design = puf_svy 
+)
+
+summary(model_hs)
+
+
+# MENTAL HEALTH MODEL
+# tenure main effect only model
+model_mh <- svyglm(
+  mentaldis ~
+    tenure3 +
+    thhld_numper +
+    age +
+    eeduc +
+    ms2 +
+    race +
+    egender +
+    any_hlthins +
+    income7,
+  design = puf_svy 
+)
+
+summary(model_mh)
+```
+
+```{r}
+stargazer(model_hs, model_mh, dep.var.labels = c("Health Status", "Mental Distress"), ci = TRUE, ci.level = 0.95, single.row = TRUE, type = "text", star.cutoffs = c(0.05, 0.01, 0.001), star.char = c("*", "**", "***"))
+```
+
+## Differences between Tenure Statuses and Health and Mental Health Over Time
+
+```{r}
+# HEALTH MODEL
+# health time-only model
+model_hs_tot3_ua <- svyglm(
+  hlthstatus_num ~
+    week*tenure3,
+  design = puf_svy 
+)
+
+summary(model_hs_tot3_ua)
+ggpredict(model_hs_tot3_ua, terms = c("tenure3", "week [1, 12]"))
+interact_plot(model_hs_tot3_ua, pred = week, modx = tenure3, interval = TRUE)
+
+# health time-only model
+model_hs_tot3_ad <- svyglm(
+  hlthstatus_num ~
+    week*tenure3 +
+    thhld_numper +
+    age +
+    eeduc +
+    ms2 +
+    race +
+    egender +
+    any_hlthins +
+    income7,
+  design = puf_svy 
+)
+
+summary(model_hs_tot3_ad)
+ggpredict(model_hs_tot3_ad, terms = c("tenure3", "week [1, 12]"))
+interact_plot(model_hs_tot3_ad, pred = week, modx = tenure3, interval = TRUE)
+
+# MENTAL HEALTH MODEL
+# unadjusted mental health time-only model
+model_mh_tot3_ua <- svyglm(
+  mentaldis ~
+    week + tenure3,
+  design = puf_svy 
+)
+
+summary(model_mh_tot3_ua)
+ggpredict(model_mh_tot3_ua, terms = c("tenure3", "week [1, 12]"))
+interact_plot(model_mh_tot3_ua, pred = week, modx = tenure3, interval = TRUE)
+
+# adjusted mental health time-only model
+model_mh_tot3_ad <- svyglm(
+  mentaldis ~
+    week + tenure3 +
+    thhld_numper +
+    age +
+    eeduc +
+    ms2 +
+    race +
+    egender +
+    any_hlthins +
+    income7,
+  design = puf_svy 
+)
+
+summary(model_mh_tot3_ad)
+ggpredict(model_mh_tot3_ad, terms = c("tenure3", "week [1, 12]"))
+interact_plot(model_mh_tot3_ad, pred = week, modx = tenure3, interval = TRUE)
+```
+
+```{r}
+stargazer(model_hs_tot3_ua, model_hs_tot3_ad, model_mh_tot3_ua, model_mh_tot3_ad, dep.var.labels = c("Health Status", "Mental Distress"), ci = TRUE, ci.level = 0.95, single.row = TRUE, type = "text", star.cutoffs = c(0.05, 0.01, 0.001), star.char = c("*", "**", "***"))
+```
+
+## Associations between Health/Mental Health and Tenure x Mortgage Confidence
+
+```{r}
+# HEALTH MODELS
+# health time-only model
+model_hs_t3mc_ua <- svyglm(
+  hlthstatus_num ~
+    tenure3*mortconf4,
+  design = puf_svy
+)
+
+summary(model_hs_t3mc_ua)
+ggpredict(model_hs_t3mc_ua, terms = c("tenure3", "mortconf4"))
+cat_plot(model_hs_t3mc_ua, pred = mortconf4, modx = tenure3, interval = TRUE)
+
+# health time-only model
+model_hs_t3mc_ad <- svyglm(
+  hlthstatus_num ~
+    week +
+    tenure3*mortconf4 +
+    thhld_numper +
+    age +
+    eeduc +
+    ms2 +
+    race +
+    egender +
+    any_hlthins +
+    income7,
+  design = puf_svy
+)
+
+summary(model_hs_t3mc_ad)
+ggpredict(model_hs_t3mc_ad, terms = c("tenure3", "mortconf4"))
+cat_plot(model_hs_t3mc_ad, pred = mortconf4, modx = tenure3, interval = TRUE)
+
+
+# MENTAL HEALTH MODELS
+# mental health ~ tenure (unadjusted)
+model_mh_t3mc_ua <- svyglm(
+  mentaldis ~
+    tenure3*mortconf4,
+  design = puf_svy
+)
+
+summary(model_mh_t3mc_ua)
+ggpredict(model_mh_t3mc_ua, terms = c("tenure3", "mortconf4"))
+cat_plot(model_mh_t3mc_ua, pred = mortconf4, modx = tenure3, interval = TRUE)
+
+# mental health ~ tenure (adjusted)
+model_mh_t3mc_ad <- svyglm(
+  mentaldis ~
+    week +
+    tenure3*mortconf4 +
+    thhld_numper +
+    age +
+    eeduc +
+    ms2 +
+    race +
+    egender +
+    any_hlthins +
+    income7,
+  design = puf_svy
+)
+
+summary(model_mh_t3mc_ad)
+ggpredict(model_mh_t3mc_ad, terms = c("tenure3", "mortconf4"))
+cat_plot(model_mh_t3mc_ad, pred = tenure3, modx = mortconf4, interval = TRUE)
+```
+
+```{r}
+stargazer(model_hs_t3mc_ua, model_hs_t3mc_ad, model_mh_t3mc_ua, model_mh_t3mc_ad, dep.var.labels = c("Health Status", "Mental Distress"), ci = TRUE, ci.level = 0.95, single.row = TRUE, type = "text", star.cutoffs = c(0.05, 0.01, 0.001), star.char = c("*", "**", "***"))
+```
+
+## Associations between Health/Mental Health and Tenure x Work Loss
+
+```{r}
+# HEALTH MODELS
+# health time-only model
+model_hs_t3wl_ua <- svyglm(
+  hlthstatus_num ~
+    tenure3 + wrkloss,
+  design = puf_svy
+)
+
+summary(model_hs_t3wl_ua)
+ggpredict(model_hs_t3wl_ua, terms = c("tenure3", "wrkloss"))
+cat_plot(model_hs_t3wl_ua, pred = wrkloss, modx = tenure3, interval = TRUE)
+
+# health time-only model
+model_hs_t3wl_ad <- svyglm(
+  hlthstatus_num ~
+    week +
+    tenure3 + wrkloss +
+    thhld_numper +
+    age +
+    eeduc +
+    ms2 +
+    race +
+    egender +
+    any_hlthins +
+    income7,
+  design = puf_svy
+)
+
+summary(model_hs_t3wl_ad)
+ggpredict(model_hs_t3wl_ad, terms = c("tenure3", "wrkloss"))
+cat_plot(model_hs_t3wl_ad, pred = wrkloss, modx = tenure3, interval = TRUE)
+
+
+# MENTAL HEALTH MODELS
+# mental health ~ tenure (unadjusted)
+model_mh_t3wl_ua <- svyglm(
+  mentaldis ~
+    tenure3*wrkloss,
+  design = puf_svy
+)
+
+summary(model_mh_t3wl_ua)
+ggpredict(model_mh_t3wl_ua, terms = c("tenure3", "wrkloss"))
+cat_plot(model_mh_t3wl_ua, pred = wrkloss, modx = tenure3, interval = TRUE)
+
+# mental health ~ tenure (adjusted)
+model_mh_t3wl_ad <- svyglm(
+  mentaldis ~
+    week +
+    tenure3*wrkloss +
+    thhld_numper +
+    age +
+    eeduc +
+    ms2 +
+    race +
+    egender +
+    any_hlthins +
+    income7,
+  design = puf_svy
+)
+
+summary(model_mh_t3wl_ad)
+ggpredict(model_mh_t3wl_ad, terms = c("tenure3", "wrkloss"))
+cat_plot(model_mh_t3wl_ad, pred = wrkloss, modx = tenure3, interval = TRUE)
+```
+
+```{r}
+stargazer(model_hs_t3wl_ua, model_hs_t3wl_ad, model_mh_t3wl_ua, model_mh_t3wl_ad, dep.var.labels = c("Health Status", "Mental Distress"), ci = TRUE, ci.level = 0.95, single.row = TRUE, type = "text", star.cutoffs = c(0.05, 0.01, 0.001), star.char = c("*", "**", "***"))
+```
+
+## Associations between Health/Mental Health and TenurexFood Confidence
+
+```{r}
+# HEALTH MODELS
+# health time-only model
+model_hs_t3fc_ua <- svyglm(
+  hlthstatus_num ~
+    tenure3*foodconf3,
+  design = puf_svy
+)
+
+summary(model_hs_t3fc_ua)
+ggpredict(model_hs_t3fc_ua, terms = c("tenure3", "foodconf3"))
+cat_plot(model_hs_t3fc_ua, pred = foodconf3, modx = tenure3, interval = TRUE)
+
+# health time-only model
+model_hs_t3fc_ad <- svyglm(
+  hlthstatus_num ~
+    week +
+    tenure3*foodconf3 +
+    thhld_numper +
+    age +
+    eeduc +
+    ms2 +
+    race +
+    egender +
+    any_hlthins +
+    income7,
+  design = puf_svy
+)
+
+summary(model_hs_t3fc_ad)
+ggpredict(model_hs_t3fc_ad, terms = c("tenure3", "foodconf3"))
+cat_plot(model_hs_t3fc_ad, pred = foodconf3, modx = tenure3, interval = TRUE)
+
+# MENTAL HEALTH MODELS
+# mental health ~ tenure (unadjusted)
+model_mh_t3fc_ua <- svyglm(
+  mentaldis ~
+    tenure3*foodconf3,
+  design = puf_svy
+)
+
+summary(model_mh_t3fc_ua)
+ggpredict(model_mh_t3fc_ua, terms = c("tenure3", "foodconf3"))
+cat_plot(model_mh_t3fc_ua, pred = foodconf3, modx = tenure3, interval = TRUE)
+
+# mental health ~ tenure (adjusted)
+model_mh_t3fc_ad <- svyglm(
+  mentaldis ~
+    week +
+    tenure3*foodconf3 +
+    thhld_numper +
+    age +
+    eeduc +
+    ms2 +
+    race +
+    egender +
+    any_hlthins +
+    income7,
+  design = puf_svy
+)
+
+summary(model_mh_t3fc_ad)
+ggpredict(model_mh_t3fc_ad, terms = c("tenure3", "foodconf3"))
+cat_plot(model_mh_t3fc_ad, pred = foodconf3, modx = tenure3, interval = TRUE)
+```
+
+```{r}
+stargazer(model_hs_t3fc_ua, model_hs_t3fc_ad, model_mh_t3fc_ua, model_mh_t3fc_ad, dep.var.labels = c("Health Status", "Mental Distress"), ci = TRUE, ci.level = 0.95, single.row = TRUE, type = "text", star.cutoffs = c(0.05, 0.01, 0.001), star.char = c("*", "**", "***"))
+```

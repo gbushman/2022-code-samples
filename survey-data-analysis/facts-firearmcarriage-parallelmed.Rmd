@@ -1,0 +1,297 @@
+---
+title: "FACTS Firearm Carriage Parallel Mediation Analysis"
+date: "11/5/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r init, include=FALSE}
+# load packages
+library(tidyverse)
+library(haven)
+library(readxl)
+library(survey)
+library(labelled)
+library(jtools)
+library(tableone)
+library(knitr)
+library(lavaan)
+library(lavaan.survey)
+library(lavaanPlot)
+
+# load the data
+facts <- read_sav("C:/Users/grego/Box/FACTS National Survey Data & Workspace/Data/FACTS_National_Survey_2020_Parent_w_Student_Appended_20201119.sav")
+
+# make variable names lower case
+facts <- rename_all(facts, tolower)
+```
+
+```{r, include = FALSE}
+# define function for recoding yes/no data so that 1 = yes, 0 = no
+recode12_01 <- function(x){abs(x-2)}
+
+# set up analytic frame for analyzing student data
+facts_stu <- facts %>%
+  filter(student_consent == 1) %>%
+  mutate_at(vars(starts_with("student_commviol")), recode12_01) %>%
+  mutate_at(vars(starts_with("student_schoolpoli")), recode12_01) %>%
+  mutate(
+    student_teenvict = rowMeans(select(., student_teenvict_mod, student_teenvict_sev1, student_teenvict_sev2)),
+    student_commviol = rowSums(select(., starts_with("student_commviol"))),
+    student_posschatt = rowMeans(select(., student_possch_att1, student_possch_att2, student_possch_att3)),
+    student_schoolsaf = rowMeans(select(., student_school_saf1, student_school_saf2)),
+    student_schoolviolexpos = rowMeans(select(., student_schoolviolexpos1, student_schoolviolexpos2, student_schoolviolexpos3)),
+    student_facarry_any = ifelse(student_facarry1 > 1, TRUE, FALSE),
+    student_attviolretal = rowMeans(select(., student_attviolretal1, student_attviolretal2, student_attviolretal3)),
+    student_gad2_pos = ifelse(student_gad2_1 + student_gad2_2 >= 4, TRUE, FALSE),
+    student_phq2_pos = ifelse(student_phq2_1 + student_phq2_2 >= 4, TRUE, FALSE),
+    student_race = case_when(
+      student_race_ethn == 1 ~ "Black",
+      student_race_ethn == 2 ~ "White",
+      student_race_ethn %in% c(3:8) ~ "Other"
+    ),
+    student_race = factor(student_race, levels = c("White", "Black", "Other")),
+    student_hisp = ifelse(student_hispanic == 1, "Hispanic", "Non-Hispanic"),
+    student_hisp = factor(student_hisp, levels = c("Non-Hispanic", "Hispanic")),
+    student_raceth4 = case_when(
+      student_hisp == "Hispanic" ~ "Hispanic",
+      student_hisp == "Non-Hispanic" & student_race == "White" ~ "NH White",
+      student_hisp == "Non-Hispanic" & student_race == "Black" ~ "NH Black",
+      student_hisp == "Non-Hispanic" & student_race == "Other" ~ "NH Other"
+    ),
+    student_raceth4 = factor(student_raceth4, levels = c("NH White", "NH Black", "Hispanic", "NH Other")),
+    student_gender = case_when(
+      student_gender_ident == 1 ~ "Cis Female",
+      student_gender_ident == 2 ~ "Cis Male",
+      student_gender_ident == 3 ~ "Trans Male",
+      student_gender_ident == 4 ~ "Trans Female",
+      student_gender_ident %in% c(5,6) ~ "Other"
+    ),
+    student_gender = factor(student_gender, levels = c("Cis Male", "Cis Female", "Trans Male", "Trans Female", "Other")),
+    student_gender3 = case_when(
+      student_gender_ident == 1 ~ "Cis Female",
+      student_gender_ident == 2 ~ "Cis Male",
+      student_gender_ident == 3 ~ "Trans, NB, Other",
+      student_gender_ident == 4 ~ "Trans, NB, Other",
+      student_gender_ident %in% c(5,6) ~ "Trans, NB, Other"
+    ),
+    student_gender3 = factor(student_gender3, levels = c("Cis Male", "Cis Female", "Trans, NB, Other"))
+  ) %>%
+  mutate_if(is.labelled, to_factor)
+```
+
+## FACTS Survey Data Summaries
+
+```{r}
+### Create Abridged Dataset (keep only things we're modeling)
+
+# abridged dataset
+# create indicator variables
+facts_stu_abr <- facts_stu %>% 
+  dplyr::select(response_id, weight, student_facarry_any, student_schoolviolexpos, student_attviolretal, student_schoolsaf, student_raceth4, student_gender3) %>% 
+  na.omit() %>%
+  mutate(
+    male_ind = ifelse(student_gender3 == "Cis Male", TRUE, FALSE),
+    female_ind = ifelse(student_gender3 == "Cis Female", TRUE, FALSE),
+    transnb_ind = ifelse(student_gender3 == "Trans, NB, Other", TRUE, FALSE),
+    white_ind = ifelse(student_raceth4 == "NH White", TRUE, FALSE),
+    black_ind = ifelse(student_raceth4 == "NH Black", TRUE, FALSE),
+    hisp_ind = ifelse(student_raceth4 == "Hispanic", TRUE, FALSE),
+    raceother_ind = ifelse(student_raceth4 == "NH Other", TRUE, FALSE)
+  )
+
+facts_stu_abr_svy <- svydesign(id = ~0, weights = ~weight, data = facts_stu_abr)
+```
+
+### Descriptive Stats
+
+```{r}
+# overall
+tableOne <- svyCreateTableOne(vars = c("student_facarry_any", "student_schoolsaf", "student_schoolviolexpos", "student_attviolretal", "student_raceth4", "student_gender3"), data = facts_stu_abr_svy)
+
+kable(print(tableOne))
+
+# stratified
+tableOne <- svyCreateTableOne(vars = c("student_schoolsaf", "student_schoolviolexpos", "student_attviolretal", "student_raceth4", "student_gender3"), strata = c("student_facarry_any"), data = facts_stu_abr_svy)
+
+kable(print(tableOne))
+```
+
+### Correlation Matrix
+
+```{r}
+svycor(~student_facarry_any + student_schoolsaf + student_schoolviolexpos + student_attviolretal, na.rm = TRUE, design = facts_stu_abr_svy)
+```
+
+## FACTS Survey Analyses
+
+### Do perceptions of school climate/school safety or attitudes toward violence mediate the relationship between school exposures to violence and firearm carriage?
+
+#### Mediation Test (unadjusted for controls)
+
+```{r}
+mod1 <- "# a path
+         student_schoolsaf ~ a*student_schoolviolexpos
+         student_attviolretal ~ aa*student_schoolviolexpos
+
+         # b path
+         student_facarry_any ~ b*student_schoolsaf + bb*student_attviolretal
+
+         # c prime path 
+         student_facarry_any ~ cp*student_schoolviolexpos
+
+         # indirect and total effects
+         ab1 := a*b
+         ab2 := aa*bb
+         total := cp + ab1 + ab2
+         
+         # correlate the residuals of the mediators
+         student_schoolsaf ~~ student_attviolretal"
+```
+
+```{r}
+# # run the weighted SEM using the lavaan.survey() function
+# set.seed(20201204)
+# 
+# lavaan.fit <- sem(mod1, data = facts_stu_abr)
+# survey.fit <- lavaan.survey(lavaan.fit, survey.design = facts_stu_abr_svy)
+# 
+# summary(survey.fit, standardized = TRUE)
+# fitMeasures(survey.fit, c("cfi", "tli", "rmsea", "srmr"))
+# options(max.print = 1000000)
+# unclass(vcov(survey.fit))
+```
+
+```{r}
+# run the weighted SEM using the sampling.weights option within lavaan
+set.seed(20201204)
+
+lavaan.fit.ua <- sem(mod1, data = facts_stu_abr, sampling.weights = "weight", estimator = "ml")
+
+summary(lavaan.fit.ua, standardized = TRUE)
+fitMeasures(lavaan.fit.ua, c("cfi", "tli", "rmsea", "srmr"))
+unclass(vcov(lavaan.fit.ua))
+
+lavaanPlot(model = lavaan.fit.ua, labels = c(student_facarry_any = "Firearm Carriage (Yes)", student_schoolsaf = "Perceptions of School Safety", student_attviolretal = "Attitudes Toward Violence/Retaliation", student_schoolviolexpos = "School Violence Exposure"), coefs = TRUE, stars = "regress")
+```
+
+#### Mediation Test (adjusted for controls)
+
+```{r}
+mod2 <- "# a path
+         student_schoolsaf ~ a*student_schoolviolexpos + female_ind + transnb_ind + black_ind + hisp_ind + raceother_ind
+         student_attviolretal ~ aa*student_schoolviolexpos + female_ind + transnb_ind + black_ind + hisp_ind + raceother_ind
+
+         # b path
+         student_facarry_any ~ b*student_schoolsaf + bb*student_attviolretal + female_ind + transnb_ind + black_ind + hisp_ind + raceother_ind
+
+         # c prime path 
+         student_facarry_any ~ cp*student_schoolviolexpos
+
+         # indirect and total effects
+         ab1 := a*b
+         ab2 := aa*bb
+         total := cp + ab1 + ab2
+         
+         # correlate the residuals of the mediators
+         student_schoolsaf ~~ student_attviolretal"
+```
+
+```{r}
+# # run the weighted SEM using the lavaan.survey() function
+# set.seed(20201204)
+# 
+# lavaan.fit <- sem(mod2, data = facts_stu_abr)
+# survey.fit <- lavaan.survey(lavaan.fit, survey.design = facts_stu_abr_svy)
+# 
+# summary(survey.fit, standardized = TRUE)
+# fitMeasures(survey.fit, c("cfi", "tli", "rmsea", "srmr"))
+# options(max.print = 1000000)
+# unclass(vcov(survey.fit))
+```
+
+```{r}
+# run the weighted SEM using the sampling.weights option within lavaan
+set.seed(20201204)
+
+lavaan.fit.ad <- sem(mod2, data = facts_stu_abr, sampling.weights = "weight", estimator = "ml")
+
+summary(lavaan.fit.ad, standardized = TRUE)
+fitMeasures(lavaan.fit.ad, c("cfi", "tli", "rmsea", "srmr"))
+unclass(vcov(lavaan.fit.ad))
+
+lavaanPlot(model = lavaan.fit.ad, labels = c(student_facarry_any = "Firearm Carriage (Yes)", student_schoolsaf = "Perceptions of School Safety", student_attviolretal = "Attitudes Toward Violence/Retaliation", student_schoolviolexpos = "School Violence Exposure"), coefs = TRUE, stars = "regress")
+```
+
+#### Mediation Test (unadjusted for controls, excluding youth who carry for hunting)
+
+```{r}
+### Create Abridged Dataset (keep only things we're modeling)
+
+# filter out youth who said they carried guns for "other" reasons
+# abridged dataset
+# create indicator variables
+facts_stu_abr <- facts_stu %>% 
+  filter(student_facarry2 %in% c("For fun or excitement", "For protection", NA)) %>%
+  dplyr::select(response_id, weight, student_facarry_any, student_schoolviolexpos, student_attviolretal, student_schoolsaf, student_raceth4, student_gender3) %>% 
+  na.omit() %>%
+  mutate(
+    male_ind = ifelse(student_gender3 == "Cis Male", TRUE, FALSE),
+    female_ind = ifelse(student_gender3 == "Cis Female", TRUE, FALSE),
+    transnb_ind = ifelse(student_gender3 == "Trans, NB, Other", TRUE, FALSE),
+    white_ind = ifelse(student_raceth4 == "NH White", TRUE, FALSE),
+    black_ind = ifelse(student_raceth4 == "NH Black", TRUE, FALSE),
+    hisp_ind = ifelse(student_raceth4 == "Hispanic", TRUE, FALSE),
+    raceother_ind = ifelse(student_raceth4 == "NH Other", TRUE, FALSE)
+  )
+
+facts_stu_abr_svy <- svydesign(id = ~0, weights = ~weight, data = facts_stu_abr)
+```
+
+```{r}
+# overall
+tableOne <- svyCreateTableOne(vars = c("student_facarry_any", "student_schoolsaf", "student_schoolviolexpos", "student_attviolretal", "student_raceth4", "student_gender3"), data = facts_stu_abr_svy)
+
+kable(print(tableOne))
+
+# stratified
+tableOne <- svyCreateTableOne(vars = c("student_schoolsaf", "student_schoolviolexpos", "student_attviolretal", "student_raceth4", "student_gender3"), strata = c("student_facarry_any"), data = facts_stu_abr_svy)
+
+kable(print(tableOne))
+```
+
+```{r}
+mod3 <- "# a path
+         student_schoolsaf ~ a*student_schoolviolexpos
+         student_attviolretal ~ aa*student_schoolviolexpos
+
+         # b path
+         student_facarry_any ~ b*student_schoolsaf + bb*student_attviolretal
+
+         # c prime path 
+         student_facarry_any ~ cp*student_schoolviolexpos
+
+         # indirect and total effects
+         ab1 := a*b
+         ab2 := aa*bb
+         total := cp + ab1 + ab2
+         
+         # correlate the residuals of the mediators
+         student_schoolsaf ~~ student_attviolretal"
+```
+
+```{r}
+# run the weighted SEM using the sampling.weights option within lavaan
+set.seed(20201204)
+
+lavaan.fit.ua <- sem(mod3, data = facts_stu_abr, sampling.weights = "weight", estimator = "ml")
+
+summary(lavaan.fit.ua, standardized = TRUE)
+fitMeasures(lavaan.fit.ua, c("cfi", "tli", "rmsea", "srmr"))
+unclass(vcov(lavaan.fit.ua))
+
+lavaanPlot(model = lavaan.fit.ua, labels = c(student_facarry_any = "Firearm Carriage (Yes)", student_schoolsaf = "Perceptions of School Safety", student_attviolretal = "Attitudes Toward Violence/Retaliation", student_schoolviolexpos = "School Violence Exposure"), coefs = TRUE, stars = "regress")
+```

@@ -1,0 +1,199 @@
+---
+title: "Kernel Density Calculations"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Load R Packages, Initialize ArcGIS/Python Connections
+
+```{r}
+# import libraries
+library(tidyverse)
+library(tidycensus)
+library(sf)
+library(readxl)
+library(lubridate)
+library(arcgisbinding)
+library(haven)
+library(reticulate)
+
+# initialize R-arcgis binding
+arc.check_product()
+
+# make sure to use correct versions of arcgis/python
+use_python("C:/Program Files/ArcGIS/Pro/bin/Python/envs/arcgispro-py3/python.exe", required = TRUE)
+# py_run_string("import arcpy")
+
+# define kernel density python script
+kd_script = "U:/HBHE/PhD/Bushman/GitHub/yvpc-analysis/crime-outcomes-analyses/flint/arcpy-crime-kde-layers.py"
+
+# define working geodatabase
+gdb = "C:/Users/grego/Documents/ArcGIS/Projects/PRC Work/YVPC/crime-kernel-density-calcs/crime-kernel-density-calcs.gdb"
+```
+
+
+# Read-in Flint Shapefiles
+
+```{r}
+# import flint shapefile
+flint <- read_sf("U:/HBHE/PRC/GIS/Projects/MI-YVPC 2015-2020/Base Data/2018/Flint_MI_2018.gdb", "FL10_CityBoundary_v1") %>%
+  st_transform(crs = 6498)
+
+# create version with 1000m buffer
+flint_1000m <- st_buffer(flint, 1000)
+
+# flint street segments
+flint_stseg <- st_read("U:/Secure/PRC/Data Repository/_Open GIS/mi-fl-street-segments/Infrastructure.gdb", "FL_streets_v17a") %>%
+  st_transform(flint_stseg, crs = 6498) %>%
+  filter(NFC != 1)
+
+# calculate centroids of street segments
+flint_stseg_centroids <- st_centroid(flint_stseg)
+
+# flint parcels
+flint_parcel <- read_sf("U:/HBHE/PRC/GIS/Projects/MI-YVPC 2015-2020/Base Data/2018/Flint_MI_2018.gdb", "FL18_MIYVPC_Parcels_v12") %>%
+  st_transform(crs = 6498)
+
+# calculate centroids of parcels
+flint_parcel_centroids <- st_centroid(flint_parcel)
+```
+
+
+# Read-in / Combine Crime Data
+
+```{r}
+# import statewide crime data
+crime_15 <- read_csv("U:/Secure/PRC/Data Repository/_Open Crime Data/michigan/clean-indirectly-identifiable/MI15_CrimeData_Clean.csv", col_types = cols(offense_weapon_code = col_character(), geo_lat = col_double(), geo_long = col_double(), geo_score = col_double(), geo_address = col_character(), geo_state = col_character(), geo_zipcode = col_character(), geo_city = col_character()))
+
+crime_16 <- read_csv("U:/Secure/PRC/Data Repository/_Open Crime Data/michigan/clean-indirectly-identifiable/MI16_CrimeData_Clean.csv", col_types = cols(offense_weapon_code = col_character(), geo_lat = col_double(), geo_long = col_double(), geo_score = col_double(), geo_address = col_character(), geo_state = col_character(), geo_zipcode = col_character(), geo_city = col_character()))
+
+crime_17 <- read_csv("U:/Secure/PRC/Data Repository/_Open Crime Data/michigan/clean-indirectly-identifiable/MI17_CrimeData_Clean.csv", col_types = cols(offense_weapon_code = col_character(), geo_lat = col_double(), geo_long = col_double(), geo_score = col_double(), geo_address = col_character(), geo_state = col_character(), geo_zipcode = col_character(), geo_city = col_character()))
+
+crime_18 <- read_csv("U:/Secure/PRC/Data Repository/_Open Crime Data/michigan/clean-indirectly-identifiable/MI18_CrimeData_Clean.csv", col_types = cols(offense_weapon_code = col_character(), geo_lat = col_double(), geo_long = col_double(), geo_score = col_double(), geo_address = col_character(), geo_state = col_character(), geo_zipcode = col_character(), geo_city = col_character()))
+
+crime_19 <- read_csv("U:/Secure/PRC/Data Repository/_Open Crime Data/michigan/clean-indirectly-identifiable/MI19_CrimeData_Clean.csv", col_types = cols(offense_weapon_code = col_character(), geo_lat = col_double(), geo_long = col_double(), geo_score = col_double(), geo_address = col_character(), geo_state = col_character(), geo_zipcode = col_character(), geo_city = col_character(), zipcode = col_character()))
+
+
+# combine crime data
+all_crimes <- bind_rows(crime_15, crime_16, crime_17, crime_18, crime_19)
+```
+
+
+# Split Data into Layers (based on month-year) for a Geodatabase
+
+```{r}
+# create field to split on
+all_crimes$split <- strftime(all_crimes$incident_date, format = "%m_%Y")
+
+# filter to part I crime incidents
+p1_crimes <- all_crimes %>% 
+  filter(
+    part1_crimes == 1,
+    flint_1000m_buffer == 1,
+    !is.na(geo_lat),
+    !is.na(geo_long),
+    geo_score >= 85,
+    usable_geo_type == 1
+  ) %>%
+  distinct()
+
+# make all crimes spatial
+p1_crimes <- p1_crimes %>%
+  st_as_sf(coords = c("geo_long", "geo_lat"), crs = 4326) %>%
+  st_transform(crs = 6498)
+
+# split based on month-year
+p1_crimes_list <- split(p1_crimes, p1_crimes$split)
+```
+
+
+# Create Layers in Geodatabase
+
+```{r}
+# reference shapes
+# flint shape
+arc.write(str_c(gdb, "/flint"), flint, overwrite = F)
+arc.write(str_c(gdb, "/flint"), flint, overwrite = T) # first write is always glitchy, so write it again to make sure
+
+# flint + 1000 m shape
+arc.write(str_c(gdb, "/flint_1000m"), flint_1000m, overwrite = F)
+
+# flint street segments
+arc.write(str_c(gdb, "/flint_stsegs"), flint_stseg, overwrite = F)
+
+# flint street segment centroids
+arc.write(str_c(gdb, "/flint_stseg_centroids"), flint_stseg_centroids, overwrite = F)
+
+# flint parcels
+arc.write(str_c(gdb, "/flint_parcel"), flint_parcel, overwrite = F)
+
+# flint parcels centroids
+arc.write(str_c(gdb, "/flint_parcel_centroids"), flint_parcel_centroids, overwrite = F)
+```
+
+```{r}
+# crime incident point layers
+for (i in 1:length(p1_crimes_list)){
+  layer = p1_crimes_list[[i]]
+  layer_name = names(p1_crimes_list[i])
+  arc.write(str_c(gdb, "/p1crimes_", layer_name), layer, overwrite = T)
+}
+```
+
+
+# Call Kernel Density Function in ArcPy
+
+```{r}
+py_run_file(kd_script)
+```
+
+
+# Aggregate Kernel Density Data
+
+```{r}
+# create list of part I crime layers to open
+kd_extract_layers <- names(p1_crimes_list)
+
+# create empty data frame for part I crime densities
+p1crimes_monthly_parcel_densities = data.frame(
+  MIYVPC_Parcel_ID = character(),
+  Parcel_ID = character(),
+  month = character(),
+  p1crimes_monthdensity_sqmile = double()
+)
+
+# open layers
+# read in contents
+# format contents
+# append to empty data frame
+for (density_month in kd_extract_layers){
+  
+  opened_layer = arc.open(str_c(gdb, "/p1crimes_", density_month, "_kd_parcel_extract"))
+  
+  selected_data = arc.select(opened_layer, fields = c("MIYVPC_Parcel_ID", "Parcel_ID", "RASTERVALU"))
+  
+  output_data <- selected_data %>%
+  rename(p1crimes_monthdensity_sqmile = "RASTERVALU") %>%
+  mutate(month = density_month) %>%
+  as.data.frame()
+  
+  p1crimes_monthly_parcel_densities = bind_rows(p1crimes_monthly_parcel_densities, output_data)
+}
+```
+
+
+# Format and Export Density Data
+
+```{r}
+# format date field
+p1crimes_monthly_parcel_densities <- p1crimes_monthly_parcel_densities %>%
+  separate(month, into = c("month", "year"), sep = "_") %>%
+  mutate(date = as.Date(str_c(month, "-01-", year), format = "%m-%d-%Y"))
+
+# export the data
+write_csv(p1crimes_monthly_parcel_densities, "U:/Secure/PRC/Data Repository/_Open Public Art Data/_data-inbox/p1crime-density-by-parcel-2015-2019-gb.csv")
+```
